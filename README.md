@@ -2,7 +2,7 @@
 ## Model supported:
 | Model | Repo |
 |-------|-----------|
-| Stable Signature | [Github](hhttps://github.com/facebookresearch/stable_signature) |
+| Stable Signature | [Github](https://github.com/facebookresearch/stable_signature) |
 | AquaLoRA | [GitHub](https://github.com/Georgefwt/AquaLoRA) |
 
 ## Abstract:
@@ -44,7 +44,7 @@ conda activate aqualora
 
 | Model | Download Link |
 |-------|---------------|
-| Stable Signature | [model](hhttps://dl.fbaipublicfiles.com/ssl_watermarking/dec_48b.pth) |
+| Stable Signature | [model](https://dl.fbaipublicfiles.com/ssl_watermarking/dec_48b.pth) |
 | Aqualora | [model](huggingface.co/georgefen/AquaLoRA-Models/tree/main/rob_finetuned) |
 
 ### Pretraining 
