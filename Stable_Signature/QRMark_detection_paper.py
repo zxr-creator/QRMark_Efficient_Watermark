@@ -4,7 +4,6 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-# TODO: Add interleaving and adaptive tiling
 import argparse
 import json
 import os
@@ -32,7 +31,7 @@ import utils
 import utils_img
 import utils_model
 import glob
-from optimized_transform import VQGANTransformFuse
+from optimized_transform import optimized_transform
 from PIL import Image
 
 sys.path.append('src')
@@ -50,19 +49,7 @@ from tradeoff_stream_alloc import (
     allocate_streams_greedy_exact_flow,
     recommend_B_cap,
     choose_Q_under_caps,
-    plan_alloc_with_optional_fuse,        # NEW
-)
-
-try:
-    import decord                                                         # add
-    _HAS_DECORD = True
-except ImportError:
-    _HAS_DECORD = False
-try:
-    import cv2                                                            # add
-    _HAS_OPENCV = True
-except ImportError:
-    _HAS_OPENCV = False
+    )
     
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -149,6 +136,38 @@ def decode_reed_solomon(encoded_tensor: torch.Tensor, nbits: int, num_parity_sym
     decoded_tensor = torch.tensor(decoded_list, dtype=torch.float32, device=encoded_tensor.device)
     return decoded_tensor
 
+def collate_fn(batch):
+    """ Collate function for data loader. Allows to have img of different size"""
+    return batch
+        
+class ImageFolder(torch.utils.data.Dataset):
+    """ImageFolder that returns (B, 3, H, W) uint8 tensor (PIL already converted)."""
+    _EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
+
+    def __init__(self, path, transform=None, loader=default_loader, *, num_imgs=None):
+        self.samples = [
+            p.as_posix()
+            for p in Path(path).rglob('*')            
+            if p.suffix.lower() in self._EXTS
+        ]
+        if num_imgs is not None and num_imgs < len(self.samples):
+            import random
+            self.samples = random.sample(self.samples, num_imgs)
+
+        self.loader = loader
+        self.transform = transform
+
+    def __getitem__(self, idx: int):
+        nvtx.range_push("load_image_and_transform")
+        assert 0 <= idx < len(self)
+        img = self.loader(self.samples[idx])  # → PIL.Image.Image
+        tensor = TF.pil_to_tensor(img)         # → (3,H,W) uint8 tensor
+        nvtx.range_pop()
+        return self.transform(tensor) if self.transform else tensor
+
+    def __len__(self):
+        return len(self.samples)
+    
 def get_parser():
     parser = argparse.ArgumentParser()
 
@@ -200,8 +219,8 @@ def get_parser():
     aa("--transform_fuse", type=utils.bool_inst, default=False, help="Wheather to use optimized transform or not.")
     aa('--wm_dir', type=str, default='dataset/watermark_imgs', help='directory to store water-marked images')
     aa("--val_batch_size", type=int, default=16, help="Batch size for profiling")
-    aa('--val_img_num', type=int, default=40504, help='The size of the image workload')
-    aa("--num_streams", type=int, default=1, help="Number of pipeline CUDA streams for detection")
+    aa('--val_img_num', type=int, default=40503, help='The size of the image workload')
+    aa("--num_streams", type=int, default=3, help="Number of pipeline CUDA streams for detection")
     aa("--num_rs_threads", type=int, default=4, help="Number of rs threads for detection")
     aa("--async_rs", type=utils.bool_inst, default=False, help="If True, use async reed-solomon correction for detection")
     aa("--videos_dir", type=str, default="/ssd2/videomme/", help="The path of the video dataset (Default: /ssd2/videomme/)")
@@ -303,7 +322,14 @@ def main(params):
 
    # Loads the data
     print(f'>>> Loading data from {params.train_dir} and {params.val_dir}...')
-    
+    vqgan_transform = transforms.Compose([
+        transforms.Resize(params.img_size),
+        transforms.CenterCrop(params.img_size),
+        transforms.ToTensor(),
+        utils_img.normalize_img,
+    ])
+    if params.transform_fuse == True:
+            vqgan_transform = optimized_transform
             
     # Create losses
     print(f'>>> Creating losses...')
@@ -368,41 +394,42 @@ def main(params):
         optim_params = utils.parse_params(params.optimizer)
         optimizer = utils.build_optimizer(model_params=ldm_decoder.parameters(), **optim_params)
         
+        ## Set transform method
         
-        vqgan_transform = transforms.ToTensor()
+        # Detection from saved images 
         
-        vqgan_to_imnet = transforms.Compose([
-        transforms.Resize(params.img_size),
-        transforms.CenterCrop(params.img_size),
-        utils_img.normalize_img,
-        ])
-        
-        if params.transform_fuse == True:
-            vqgan_to_imnet = VQGANTransformFuse(img_size=params.img_size, device=device, do_normalize=True)
-        
-            
         if params.workload =="images":
+            EVAL_IMG_NUM = 1000
+            eval_loader = utils.get_dataloader(params.wm_dir, vqgan_transform, batch_size=params.val_batch_size, num_imgs=1000, shuffle=False, num_workers=4,  collate_fn=None)
+            eval_loader = DataLoader(
+                ImageFolder(params.wm_dir, transform=None, num_imgs=EVAL_IMG_NUM),
+                batch_size=params.val_batch_size, shuffle=False, num_workers=4,
+                pin_memory=True, drop_last=False, collate_fn=None
+            )
+            eval_stats = val(eval_loader, ldm_ae, ldm_decoder, msg_decoder, optimized_transform, key, msg_key, params)
+            
             nvtx.range_push("E2E_Image_Watermark_Detection")
             print(f'>>> Detecting from saved images...')
             nvtx.range_push("Image Dataset Loading")
-            detect_loader = utils.get_dataloader(params.wm_dir, vqgan_transform, batch_size=params.val_batch_size, num_imgs=params.val_img_num, shuffle=False, num_workers=16, collate_fn=None, img_size=256)
+            imagefolder = ImageFolder(params.wm_dir, transform=None, num_imgs=params.val_img_num)
+            detect_loader = DataLoader(imagefolder, batch_size=params.val_batch_size, shuffle=False, num_workers=4, pin_memory=True, drop_last=False, collate_fn=None)
             nvtx.range_pop()
             nvtx.range_push("Core_Pipeline")
             start_e2e = time.perf_counter()
-            detect_from_images_stats = detect_from_images(detect_loader, ldm_ae, ldm_decoder, msg_decoder, vqgan_to_imnet, key, msg_key, nbit, params)
-
-            nvtx.range_pop()
-            nvtx.range_push("Core_Pipeline")
+            _ = vqgan_transform(torch.zeros(1, 3, 256, 256, device="cuda"), params.img_size)
+            detect_from_images_stats = detect_from_images(detect_loader, ldm_ae, ldm_decoder, msg_decoder, vqgan_transform, key, msg_key, nbit, params)
             torch.cuda.synchronize()
             end_e2e = time.perf_counter() 
-            print(f"[E2E] end2end time = {end_e2e - start_e2e:.4f} s")
+            print(f"[E2E] Total wall time = {end_e2e - start_e2e:.4f} s")
             nvtx.range_pop()
             nvtx.range_push("Statistics_and_Logging")
             log_stats = {
                 'key': key_str,
                 'msg_key': msg_key_str,
+                **{f"eval_{k}": v for k, v in eval_stats.items()},
                 **{f"detect_from_images_{k}": v for k, v in detect_from_images_stats.items()},
             }
+
             nvtx.range_pop()
             
             nvtx.range_pop()
@@ -431,8 +458,6 @@ def main(params):
             'optimizer': optimizer.state_dict(),
             'params': params,
         }
-
-
 
 # ---------- help function1: for image tiling ----------
 def _decode_with_tile(
@@ -488,7 +513,6 @@ def _decode_with_tile(
     else:
         return imgs_aug
     
-    
 # ---------- help function2: Compute per-stage bytes ----------    
 def _bytes_per_sample(params, nbit):
     # Stage-0 output ~ (B,3,H,W) float32
@@ -501,19 +525,23 @@ def _bytes_per_sample(params, nbit):
     s2 = nbit * 4
     return [s0, s1, s2]
 
+
+
+
+
+
 @torch.no_grad()
 def detect_from_images(
         data_loader: Iterable,
         ldm_ae, ldm_decoder, msg_decoder,
-        transform, key, msg_key, nbit, params):
+        vqgan_transform, key, msg_key, nbit, params):
 
-    import time, concurrent.futures
-    from collections import deque
-    rank   = torch.cuda.current_device()
+    rank  = torch.cuda.current_device()
     device = torch.device('cuda', rank)
+    
 
     # -------------------- 0) Warm-up --------------------
-    w = max(12, 6)
+    w = max(12, 6)  
     evt_beg = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
     evt_end = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
     lat_samples = [[], [], []]
@@ -528,8 +556,9 @@ def detect_from_images(
 
         # Stage-0: preprocess
         evt_beg[0].record()
-        imgs_aug = transform(imgs)
-
+        imgs_aug = (vqgan_transform(imgs, params.img_size)
+                    if params.transform_fuse else
+                    vqgan_transform(imgs))
         evt_end[0].record()
 
         # Stage-1: tiling
@@ -544,8 +573,7 @@ def detect_from_images(
 
         torch.cuda.synchronize()
         for k in range(3):
-            # ms -> s
-            lat_samples[k].append(evt_beg[k].elapsed_time(evt_end[k]) / 1e3)
+            lat_samples[k].append(evt_beg[k].elapsed_time(evt_end[k]) / 1e3)  # seconds
 
     def _trimmed_mean(x, trim=0.2):
         if not x:
@@ -556,11 +584,11 @@ def detect_from_images(
         xs = x[t:n - t] if n - t > t else x
         return sum(xs) / max(1, len(xs))
 
-    stage_lat = [_trimmed_mean(s, trim=0.2) for s in lat_samples]  # [t_pre, t_tile, t_decode]
+    stage_lat = [_trimmed_mean(s, trim=0.2) for s in lat_samples]
 
-    # -------------------- 1) Allocate streams with possible fuse --------------------
-    S_max   = max(3, int(getattr(params, "num_streams", 3)))
-    mem_ps  = _bytes_per_sample(params, nbit)  # [bytes_pre, bytes_tile, bytes_decode]
+    # -------------------- 1) Allocate streams (greedy) & STRICT flow --------------------
+    S_max   = max(3, int(params.num_streams))
+    mem_ps  = _bytes_per_sample(params, nbit)
 
     total_hbm   = torch.cuda.get_device_properties(0).total_memory
     M_cap_bytes = int(0.8 * total_hbm)
@@ -571,46 +599,37 @@ def detect_from_images(
                              M_cap_bytes=M_cap_bytes,
                              B_hint=B_user)
 
-    s_vec, b_vec, Q, fused = plan_alloc_with_optional_fuse(
+    util_ratio = None  # format: [u0,u1,u2]
+    s, b, Q = allocate_streams_greedy_exact_flow(
         t_baseline=stage_lat,
         B=B_cap,
         mem_per_item=mem_ps,
         M_cap_bytes=M_cap_bytes,
         S_max=S_max,
-        util_ratio=None,
-        fuse_ratio=0.35,      # t_tile <= 0.35
-        min_tile_streams=2,
+        util_ratio=util_ratio,
     )
-    # Test run
-    #s_vec = [1,1, 16]
-    #b_vec = [B_user,B_user, B_user/16]
-    #fused = False
+    if Q > 0:
+        B_cap = max(Q, (B_cap // Q) * Q)  
 
-    if not fused:
-        print(f"[SO1] (3-stage) times={stage_lat}, streams={s_vec}, b={b_vec}, Q={Q}, B_cap={B_cap}")
-        #print(f"[Alloc] STRICT flow check: {[b_vec[k]*s_vec[k] for k in range(3)]} (all == Q={Q})")
-    else:
-        print(f"[SO1] (FUSED tile+decode) times=[{stage_lat[0]:.6f}, {stage_lat[1]+stage_lat[2]:.6f}], streams={s_vec}, b={b_vec}, Q={Q}, B_cap={B_cap}")
-        print(f"[Alloc] Groups: pre | fused(tile+decode)")
-        #print(f"[Alloc] STRICT flow check: {[b_vec[k]*s_vec[k] for k in range(2)]} (all == Q={Q})")
-
+    print(f"[SO1] stage times={stage_lat}, streams={s}, per-stage micro-batch b={b}, Q={Q}, B_cap={B_cap}")
+    print(f"[Alloc] CUDA-stream vector  s = {s}")
+    print(f"[Alloc] STRICT flow check: {[b[k]*s[k] for k in range(len(s))]}  (all == Q={Q})")
+    
+    start_detect = time.perf_counter()
     # -------------------- 2) Runtime objects --------------------
-    start_detect  = time.perf_counter()
     h2d_stream    = torch.cuda.Stream(priority=-1)
+    stage_streams = [[torch.cuda.Stream() for _ in range(sk)] for sk in s]  # 0/1/2
 
-    async_rs       = bool(getattr(params, "async_rs", True))
-    num_rs_threads = int(getattr(params, "num_rs_threads", 64))
+    async_rs       = getattr(params, "async_rs", True)
+    num_rs_threads = getattr(params, "num_rs_threads", 16)
     rs_pool        = concurrent.futures.ThreadPoolExecutor(max_workers=num_rs_threads) if async_rs else None
-    pending_rs     = []
 
     metric_logger  = utils.MetricLogger(delimiter="  ")
     ldm_decoder.decoder.eval()
 
-    # Latency collectors (per big-batch)
-    latency_samples = []      # seconds
-    imgs_per_batch  = []
+    inflight0, inflight1, inflight2 = [], [], []
+    pool01, pool12 = deque(), deque()
 
-    # ---------- Common helpers ----------
     def _prefetch(batch):
         if batch is None:
             return None
@@ -644,363 +663,222 @@ def detect_from_images(
                 need = 0
         if need == 0:
             return torch.cat(chunks, dim=0)
-        return None
+        return None  
 
     def _pool_total_size(pool: deque):
         return sum(int(t.size(0)) for t in pool)
 
-    # -------------------- 3) Scheduling (two modes) --------------------
+    # -------------------- 3) Main loop --------------------
     it = iter(data_loader)
+    pending_rs = []
+    #batch_idx = 0
 
-    if not fused:
-        # ====== Original 3-stage pipeline ======
-        stage_streams = [[torch.cuda.Stream() for _ in range(int(sk))] for sk in s_vec]  # 0/1/2
-        inflight0, inflight1, inflight2 = [], [], []
-        pool01, pool12 = deque(), deque()
+    while (batch_cpu := next(it, None)) is not None:
+        batch_gpu = _prefetch(batch_cpu)
+        torch.cuda.current_stream().wait_stream(h2d_stream)
+        n_imgs = batch_gpu.size(0)
 
-        while (batch_cpu := next(it, None)) is not None:
-            batch_gpu = _prefetch(batch_cpu)
-            torch.cuda.current_stream().wait_stream(h2d_stream)
-            n_imgs = batch_gpu.size(0)
+        micro_batches0 = list(torch.split(batch_gpu, b[0]))
+        q0 = 0
 
-            # ---- latency start for this big batch ----
-            t_batch_start = time.perf_counter()
+        done_this_batch = 0
+        msg_keys_gpu = msg_key.repeat(n_imgs, 1)
+        k_ptr = 0
 
-            micro_batches0 = list(torch.split(batch_gpu, int(b_vec[0])))
-            q0 = 0
-            done_this_batch = 0
-            msg_keys_gpu = msg_key.repeat(n_imgs, 1)
-            k_ptr = 0
+        while (done_this_batch < n_imgs or inflight0 or inflight1 or inflight2
+               or pool01 or pool12 or q0 < len(micro_batches0)):
 
-            while (done_this_batch < n_imgs or inflight0 or inflight1 or inflight2
-                   or pool01 or pool12 or q0 < len(micro_batches0)):
+            made_progress = False
 
-                made_progress = False
 
-                inflight0 = _drain_inflight(inflight0, pool01)
-                inflight1 = _drain_inflight(inflight1, pool12)
+            inflight0 = _drain_inflight(inflight0, pool01)
+            inflight1 = _drain_inflight(inflight1, pool12)
 
-                # Stage-0
-                for s0 in stage_streams[0]:
-                    if q0 >= len(micro_batches0): break
-                    if len(inflight0) >= len(stage_streams[0]): break
-                    with torch.cuda.stream(s0):
-                        nvtx.range_push("VQGAN_to_IMNET")
-                        imgs_aug = transform(micro_batches0[q0])
+            # 1) Stage-0：
+            for s0 in stage_streams[0]:
+                if q0 >= len(micro_batches0):
+                    break
+                if len(inflight0) >= len(stage_streams[0]):
+                    break
+                with torch.cuda.stream(s0):
+                    nvtx.range_push("VQGAN_to_IMNET")
+                    imgs_aug = (vqgan_transform(micro_batches0[q0], params.img_size)
+                                if params.transform_fuse else
+                                vqgan_transform(micro_batches0[q0]))
+                    nvtx.range_pop()
+                ev0 = torch.cuda.Event()
+                ev0.record(s0)
+                inflight0.append((ev0, imgs_aug))
+                q0 += 1
+                made_progress = True
 
-                        nvtx.range_pop()
-                    ev0 = torch.cuda.Event(); ev0.record(s0)
-                    inflight0.append((ev0, imgs_aug))
-                    q0 += 1
+            # 2) Stage-1：
+            for s1 in stage_streams[1]:
+                if len(inflight1) >= len(stage_streams[1]):
+                    break
+                patch_in = _cat_from_pool(pool01, b[1])
+                if patch_in is None:
+                    break
+                with torch.cuda.stream(s1):
+                    nvtx.range_push("Tiling")
+                    patch = _decode_with_tile(patch_in, msg_decoder, params)
+                    nvtx.range_pop()
+                ev1 = torch.cuda.Event()
+                ev1.record(s1)
+                inflight1.append((ev1, patch))
+                made_progress = True
+
+            # 3) Stage-2：
+            for s2 in stage_streams[2]:
+                if len(inflight2) >= len(stage_streams[2]):
+                    break
+                patch_in2 = _cat_from_pool(pool12, b[2])
+                if patch_in2 is None:
+                    break
+                with torch.cuda.stream(s2):
+                    nvtx.range_push("Message_Decode")
+                    decoded = msg_decoder(patch_in2)
+                    nvtx.range_pop()
+                ev2 = torch.cuda.Event()
+                ev2.record(s2)
+                inflight2.append((ev2, decoded))
+                made_progress = True
+
+            # 4)
+            keep2 = []
+            for ev2, decoded in inflight2:
+                if ev2.query():
+                    decoded_cpu = decoded.detach().to('cpu')
+                    bs2 = decoded_cpu.size(0)
+                    msg_keys_cpu = msg_keys_gpu[k_ptr:k_ptr + bs2].detach().to('cpu')
+                    k_ptr += bs2
+                    done_this_batch += bs2
+                    if params.reed_solomon:
+                        if async_rs:
+                            fut = rs_pool.submit(
+                                decode_reed_solomon,
+                                decoded_cpu,
+                                params.num_bits,
+                                params.num_parity_symbols,
+                                params.m_bits_per_symbol
+                            )
+                            pending_rs.append((fut, msg_keys_cpu))
+                        else:
+                            decoded_corr = decode_reed_solomon(
+                                decoded_cpu,
+                                params.num_bits,
+                                params.num_parity_symbols,
+                                params.m_bits_per_symbol
+                            )
+                            _update_metrics(decoded_corr, msg_keys_cpu, metric_logger)
+                    else:
+                        _update_metrics(decoded_cpu, msg_keys_cpu, metric_logger)
                     made_progress = True
+                else:
+                    keep2.append((ev2, decoded))
+            inflight2 = keep2
 
-                # Stage-1 (tile)
-                for s1 in stage_streams[1]:
-                    if len(inflight1) >= len(stage_streams[1]): break
-                    patch_in = _cat_from_pool(pool01, int(b_vec[1]))
-                    if patch_in is None: break
+            if (not made_progress) and (q0 >= len(micro_batches0)) \
+               and (not inflight0) and (not inflight1) and (not inflight2):
+
+                total_p12 = _pool_total_size(pool12)
+                if total_p12 > 0:
+                    patch_in2 = []
+                    while pool12:
+                        patch_in2.append(pool12.popleft())
+                    patch_in2 = torch.cat(patch_in2, dim=0)
+
+                    s2 = stage_streams[2][0] 
+                    with torch.cuda.stream(s2):
+                        nvtx.range_push("Message_Decode_TAIL")
+                        decoded_tail = msg_decoder(patch_in2)
+                        nvtx.range_pop()
+                    torch.cuda.current_stream().wait_stream(s2)
+
+                    decoded_cpu = decoded_tail.detach().to('cpu')
+                    bs2 = decoded_cpu.size(0)
+                    msg_keys_cpu = msg_keys_gpu[k_ptr:k_ptr + bs2].detach().to('cpu')
+                    k_ptr += bs2
+                    done_this_batch += bs2
+
+                    if params.reed_solomon:
+                        if async_rs:
+                            fut = rs_pool.submit(
+                                decode_reed_solomon,
+                                decoded_cpu,
+                                params.num_bits,
+                                params.num_parity_symbols,
+                                params.m_bits_per_symbol
+                            )
+                            pending_rs.append((fut, msg_keys_cpu))
+                        else:
+                            decoded_corr = decode_reed_solomon(
+                                decoded_cpu,
+                                params.num_bits,
+                                params.num_parity_symbols,
+                                params.m_bits_per_symbol
+                            )
+                            _update_metrics(decoded_corr, msg_keys_cpu, metric_logger)
+                    else:
+                        _update_metrics(decoded_cpu, msg_keys_cpu, metric_logger)
+
+                    continue 
+
+                total_p01 = _pool_total_size(pool01)
+                if total_p01 > 0:
+                    patch_in = []
+                    while pool01:
+                        patch_in.append(pool01.popleft())
+                    patch_in = torch.cat(patch_in, dim=0)
+
+                    s1 = stage_streams[1][0]
+                    s2 = stage_streams[2][0]
                     with torch.cuda.stream(s1):
-                        nvtx.range_push("Tiling")
+                        nvtx.range_push("Tiling_TAIL")
                         patch = _decode_with_tile(patch_in, msg_decoder, params)
                         nvtx.range_pop()
-                    ev1 = torch.cuda.Event(); ev1.record(s1)
-                    inflight1.append((ev1, patch))
-                    made_progress = True
+                    torch.cuda.current_stream().wait_stream(s1)
 
-                # Stage-2 (decode)
-                for s2 in stage_streams[2]:
-                    if len(inflight2) >= len(stage_streams[2]): break
-                    patch_in2 = _cat_from_pool(pool12, int(b_vec[2]))
-                    if patch_in2 is None: break
                     with torch.cuda.stream(s2):
-                        nvtx.range_push("Message_Decode")
-                        decoded = msg_decoder(patch_in2)
+                        nvtx.range_push("Message_Decode_TAIL")
+                        decoded_tail = msg_decoder(patch)
                         nvtx.range_pop()
-                    ev2 = torch.cuda.Event(); ev2.record(s2)
-                    inflight2.append((ev2, decoded))
-                    made_progress = True
+                    torch.cuda.current_stream().wait_stream(s2)
 
-                # Collect Stage-2
-                keep2 = []
-                for ev2, decoded in inflight2:
-                    if ev2.query():
-                        decoded_cpu = decoded.detach().to('cpu')
-                        bs2 = decoded_cpu.size(0)
-                        msg_keys_cpu = msg_keys_gpu[k_ptr:k_ptr + bs2].detach().to('cpu')
-                        k_ptr += bs2
-                        done_this_batch += bs2
-                        if getattr(params, "reed_solomon", True):
-                            if async_rs:
-                                fut = rs_pool.submit(
-                                    decode_reed_solomon,
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                pending_rs.append((fut, msg_keys_cpu))
-                            else:
-                                decoded_corr = decode_reed_solomon(
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                _update_metrics(decoded_corr, msg_keys_cpu, metric_logger)
+                    decoded_cpu = decoded_tail.detach().to('cpu')
+                    bs2 = decoded_cpu.size(0)
+                    msg_keys_cpu = msg_keys_gpu[k_ptr:k_ptr + bs2].detach().to('cpu')
+                    k_ptr += bs2
+                    done_this_batch += bs2
+
+                    if params.reed_solomon:
+                        if async_rs:
+                            fut = rs_pool.submit(
+                                decode_reed_solomon,
+                                decoded_cpu,
+                                params.num_bits,
+                                params.num_parity_symbols,
+                                params.m_bits_per_symbol
+                            )
+                            pending_rs.append((fut, msg_keys_cpu))
                         else:
-                            _update_metrics(decoded_cpu, msg_keys_cpu, metric_logger)
-                        made_progress = True
+                            decoded_corr = decode_reed_solomon(
+                                decoded_cpu,
+                                params.num_bits,
+                                params.num_parity_symbols,
+                                params.m_bits_per_symbol
+                            )
+                            _update_metrics(decoded_corr, msg_keys_cpu, metric_logger)
                     else:
-                        keep2.append((ev2, decoded))
-                inflight2 = keep2
+                        _update_metrics(decoded_cpu, msg_keys_cpu, metric_logger)
 
-                # Tail flush
-                if (not made_progress) and (q0 >= len(micro_batches0)) \
-                   and (not inflight0) and (not inflight1) and (not inflight2):
+                    continue 
 
-                    total_p12 = _pool_total_size(pool12)
-                    if total_p12 > 0:
-                        patch_in2 = []
-                        while pool12: patch_in2.append(pool12.popleft())
-                        patch_in2 = torch.cat(patch_in2, dim=0)
-                        s2 = stage_streams[2][0]
-                        with torch.cuda.stream(s2):
-                            nvtx.range_push("Message_Decode_TAIL")
-                            decoded_tail = msg_decoder(patch_in2)
-                            nvtx.range_pop()
-                        torch.cuda.current_stream().wait_stream(s2)
+                break
 
-                        decoded_cpu = decoded_tail.detach().to('cpu')
-                        bs2 = decoded_cpu.size(0)
-                        msg_keys_cpu = msg_keys_gpu[k_ptr:k_ptr + bs2].detach().to('cpu')
-                        k_ptr += bs2
-                        done_this_batch += bs2
 
-                        if getattr(params, "reed_solomon", True):
-                            if async_rs:
-                                fut = rs_pool.submit(
-                                    decode_reed_solomon,
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                pending_rs.append((fut, msg_keys_cpu))
-                            else:
-                                decoded_corr = decode_reed_solomon(
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                _update_metrics(decoded_corr, msg_keys_cpu, metric_logger)
-                        else:
-                            _update_metrics(decoded_cpu, msg_keys_cpu, metric_logger)
-                        continue
 
-                    total_p01 = _pool_total_size(pool01)
-                    if total_p01 > 0:
-                        patch_in = []
-                        while pool01: patch_in.append(pool01.popleft())
-                        patch_in = torch.cat(patch_in, dim=0)
-
-                        s1 = stage_streams[1][0]
-                        s2 = stage_streams[2][0]
-                        with torch.cuda.stream(s1):
-                            nvtx.range_push("Tiling_TAIL")
-                            patch = _decode_with_tile(patch_in, msg_decoder, params)
-                            nvtx.range_pop()
-                        torch.cuda.current_stream().wait_stream(s1)
-
-                        with torch.cuda.stream(s2):
-                            nvtx.range_push("Message_Decode_TAIL")
-                            decoded_tail = msg_decoder(patch)
-                            nvtx.range_pop()
-                        torch.cuda.current_stream().wait_stream(s2)
-
-                        decoded_cpu = decoded_tail.detach().to('cpu')
-                        bs2 = decoded_cpu.size(0)
-                        msg_keys_cpu = msg_keys_gpu[k_ptr:k_ptr + bs2].detach().to('cpu')
-                        k_ptr += bs2
-                        done_this_batch += bs2
-
-                        if getattr(params, "reed_solomon", True):
-                            if async_rs:
-                                fut = rs_pool.submit(
-                                    decode_reed_solomon,
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                pending_rs.append((fut, msg_keys_cpu))
-                            else:
-                                decoded_corr = decode_reed_solomon(
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                _update_metrics(decoded_corr, msg_keys_cpu, metric_logger)
-                        else:
-                            _update_metrics(decoded_cpu, msg_keys_cpu, metric_logger)
-                        continue
-                    break
-
-            # ---- latency end & record ----
-            t_batch_end = time.perf_counter()
-            latency_samples.append(t_batch_end - t_batch_start)
-            imgs_per_batch.append(n_imgs)
-            # print(f"[Detect][latency] batch_latency={latency_samples[-1]:.4f}s for {n_imgs} imgs  (~{n_imgs/latency_samples[-1]:.2f} imgs/s)")
-
-    else:
-        # ====== Fused pipeline: two groups (pre | fused(tile+decode)) ======
-        s_pre, s_fused = int(s_vec[0]), int(s_vec[1])
-        b_pre, b_fused = int(b_vec[0]), int(b_vec[1])
-        stage_streams = [
-            [torch.cuda.Stream() for _ in range(s_pre)],    # pre
-            [torch.cuda.Stream() for _ in range(s_fused)],  # fused(tile+decode)
-        ]
-        inflight0, inflightF = [], []
-        pool0F = deque()
-
-        while (batch_cpu := next(it, None)) is not None:
-            batch_gpu = _prefetch(batch_cpu)
-            torch.cuda.current_stream().wait_stream(h2d_stream)
-            n_imgs = batch_gpu.size(0)
-
-            # ---- latency start for this big batch ----
-            t_batch_start = time.perf_counter()
-
-            micro_batches0 = list(torch.split(batch_gpu, b_pre))
-            q0 = 0
-            done_this_batch = 0
-            msg_keys_gpu = msg_key.repeat(n_imgs, 1)
-            k_ptr = 0
-
-            while (done_this_batch < n_imgs or inflight0 or inflightF
-                   or pool0F or q0 < len(micro_batches0)):
-
-                made_progress = False
-
-                inflight0 = _drain_inflight(inflight0, pool0F)
-
-                # Stage-0 (pre)
-                for s0 in stage_streams[0]:
-                    if q0 >= len(micro_batches0): break
-                    if len(inflight0) >= len(stage_streams[0]): break
-                    with torch.cuda.stream(s0):
-                        nvtx.range_push("VQGAN_to_IMNET")
-                        imgs_aug = transform(micro_batches0[q0])
-
-                        nvtx.range_pop()
-                    ev0 = torch.cuda.Event(); ev0.record(s0)
-                    inflight0.append((ev0, imgs_aug))
-                    q0 += 1
-                    made_progress = True
-
-                # Stage-F (tile+decode)
-                for sf in stage_streams[1]:
-                    if len(inflightF) >= len(stage_streams[1]): break
-                    imgs_aug_in = _cat_from_pool(pool0F, b_fused)
-                    if imgs_aug_in is None: break
-
-                    with torch.cuda.stream(sf):
-                        nvtx.range_push("FUSED_TileDecode")
-                        patch = _decode_with_tile(imgs_aug_in, msg_decoder, params)  # tile
-                        decoded = msg_decoder(patch)                                 # decode
-                        nvtx.range_pop()
-                    evf = torch.cuda.Event(); evf.record(sf)
-                    inflightF.append((evf, decoded))
-                    made_progress = True
-
-                # Collect Stage-F output
-                keepF = []
-                for evf, decoded in inflightF:
-                    if evf.query():
-                        decoded_cpu = decoded.detach().to('cpu')
-                        bs2 = decoded_cpu.size(0)
-                        msg_keys_cpu = msg_keys_gpu[k_ptr:k_ptr + bs2].detach().to('cpu')
-                        k_ptr += bs2
-                        done_this_batch += bs2
-
-                        if getattr(params, "reed_solomon", True):
-                            if async_rs:
-                                fut = rs_pool.submit(
-                                    decode_reed_solomon,
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                pending_rs.append((fut, msg_keys_cpu))
-                            else:
-                                decoded_corr = decode_reed_solomon(
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                _update_metrics(decoded_corr, msg_keys_cpu, metric_logger)
-                        else:
-                            _update_metrics(decoded_cpu, msg_keys_cpu, metric_logger)
-                        made_progress = True
-                    else:
-                        keepF.append((evf, decoded))
-                inflightF = keepF
-
-                # Tail flush (fused)
-                if (not made_progress) and (q0 >= len(micro_batches0)) \
-                   and (not inflight0) and (not inflightF):
-                    total_p0F = _pool_total_size(pool0F)
-                    if total_p0F > 0:
-                        imgs_aug_in = []
-                        while pool0F: imgs_aug_in.append(pool0F.popleft())
-                        imgs_aug_in = torch.cat(imgs_aug_in, dim=0)
-
-                        sf = stage_streams[1][0]
-                        with torch.cuda.stream(sf):
-                            nvtx.range_push("FUSED_TileDecode_TAIL")
-                            patch = _decode_with_tile(imgs_aug_in, msg_decoder, params)
-                            decoded_tail = msg_decoder(patch)
-                            nvtx.range_pop()
-                        torch.cuda.current_stream().wait_stream(sf)
-
-                        decoded_cpu = decoded_tail.detach().to('cpu')
-                        bs2 = decoded_cpu.size(0)
-                        msg_keys_cpu = msg_keys_gpu[k_ptr:k_ptr + bs2].detach().to('cpu')
-                        k_ptr += bs2
-                        done_this_batch += bs2
-
-                        if getattr(params, "reed_solomon", True):
-                            if async_rs:
-                                fut = rs_pool.submit(
-                                    decode_reed_solomon,
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                pending_rs.append((fut, msg_keys_cpu))
-                            else:
-                                decoded_corr = decode_reed_solomon(
-                                    decoded_cpu,
-                                    params.num_bits,
-                                    params.num_parity_symbols,
-                                    params.m_bits_per_symbol
-                                )
-                                _update_metrics(decoded_corr, msg_keys_cpu, metric_logger)
-                        else:
-                            _update_metrics(decoded_cpu, msg_keys_cpu, metric_logger)
-                        continue
-                    break
-
-            # ---- latency end & record ----
-            t_batch_end = time.perf_counter()
-            latency_samples.append(t_batch_end - t_batch_start)
-            #print(f"[Detect][latency] batch_latency={latency_samples[-1]:.4f}s for {n_imgs} imgs  (~{n_imgs/latency_samples[-1]:.2f} imgs/s)")
-
-    # ---- flush async RS ----
+    # flush async RS
     for fut, k_cpu in pending_rs:
         decoded_corr = fut.result()
         _update_metrics(decoded_corr, k_cpu, metric_logger)
@@ -1009,50 +887,121 @@ def detect_from_images(
 
     torch.cuda.synchronize()
     end_detect = time.perf_counter()
-
-    # ---- latency summary ----
-    if len(latency_samples) > 0:
-        try:
-            import numpy as _np
-            arr = _np.asarray(latency_samples, dtype=float)
-            mean = float(arr.mean())
-            #p50  = float(_np.percentile(arr, 50))
-            #p90  = float(_np.percentile(arr, 90))
-            #p95  = float(_np.percentile(arr, 95))
-            #p99  = float(_np.percentile(arr, 99))
-        except Exception:
-            arr = sorted(latency_samples)
-            n = len(arr)
-            def _pct(p):
-                idx = min(n-1, max(0, int(round((p/100.0)*(n-1)))))
-                return arr[idx]
-            mean = sum(arr)/n
-            #p50, p90, p95, p99 = _pct(50), _pct(90), _pct(95), _pct(99)
-
-        total_imgs = params.val_img_num
-        per_img_avg = (sum(latency_samples) / total_imgs) if total_imgs > 0 else float('nan')
-        # print(f"[Detect][latency] per-batch stats: mean={mean:.4f}s, p50={p50:.4f}s, p90={p90:.4f}s, p95={p95:.4f}s, p99={p99:.4f}s")
-        print(f"[Detect][latency] approx per-image latency ≈ {mean:.4f}s  (total_images={total_imgs})")
-
-    print(f"Optimized:[detect_from_images] wall time = {end_detect - start_detect:.4f} s")
-
-    # ---- accuracy print ----
-    bit_avg  = metric_logger.meters['bit_acc'].global_avg  if 'bit_acc'  in metric_logger.meters else float('nan')
-    word_avg = metric_logger.meters['word_acc'].global_avg if 'word_acc' in metric_logger.meters else float('nan')
-    print(f"[Detect] accuracy: bit_acc={bit_avg:.6f}, word_acc={word_avg:.6f}")
+    print(f"Optimized:[detect_from_images] Total wall time = {end_detect - start_detect:.4f} s")
 
     return {k: mtr.global_avg for k, mtr in metric_logger.meters.items()}
-
 # ----------------------------------------------------------------------
 def _update_metrics(decoded_cpu, key_cpu, metric_logger):
-    """
-    Update bit_acc and word_acc in the same way as detect_from_saved_images.
-    """
-    pred_bits = (decoded_cpu > 0).to(torch.int64)  # [B, nbits] {0,1}
-    bit_acc_batch = (pred_bits == key_cpu).float().mean().item()
-    word_acc_batch = (pred_bits.eq(key_cpu).all(dim=1).float().mean().item())
-    metric_logger.update(bit_acc=bit_acc_batch, word_acc=word_acc_batch)
+    diff      = ~(torch.logical_xor(decoded_cpu > 0, key_cpu > 0))
+    bit_acc   = diff.sum(dim=-1).float() / diff.size(-1)
+    word_acc  = (bit_acc == 1)
+    metric_logger.update(bit_acc=bit_acc.mean().item(),
+                         word_acc=word_acc.float().mean().item())
 # ----------------------------------------------------------------------
+
+@torch.no_grad()
+def val(data_loader: Iterable,
+        ldm_ae: AutoencoderKL, ldm_decoder: AutoencoderKL,
+        msg_decoder: nn.Module, optimized_transform: nn.Module,
+        key: torch.Tensor, msg_key: torch.Tensor,
+        params: argparse.Namespace):
+
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    header = 'Eval'
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    ldm_decoder.decoder.eval()
+
+    for ii, imgs in enumerate(metric_logger.log_every(data_loader, params.log_freq, header)):
+        # imgs: uint8 [0,255] -> float [-1,1]
+        imgs = imgs.to(device, non_blocking=True).float() / 255.0
+        imgs = imgs * 2.0 - 1.0
+
+        keys = key.repeat(imgs.size(0), 1)
+        msg_keys = msg_key.repeat(imgs.size(0), 1)
+
+        # --- encode / decode (reconstruction & watermarked) ---
+        imgs_z = ldm_ae.encode(imgs).mode()
+        imgs_d0 = ldm_ae.decode(imgs_z)
+        imgs_w  = ldm_decoder.decode(imgs_z)
+
+        # --- baseline detection (no attack) via optimized_transform ---
+        imgs_aug = (optimized_transform(imgs, params.img_size)
+                    if params.transform_fuse else
+                    optimized_transform(imgs))
+        patch   = _decode_with_tile(imgs_aug, msg_decoder, params)
+        decoded = msg_decoder(patch)
+
+        if params.reed_solomon:
+            decoded = decode_reed_solomon(decoded,
+                                          params.num_bits,
+                                          params.num_parity_symbols,
+                                          params.m_bits_per_symbol)
+
+        diff = ~torch.logical_xor(decoded > 0, msg_keys > 0)
+        bit_accs = diff.sum(dim=-1) / diff.size(-1)
+        word_accs = (bit_accs == 1)
+
+        # TPR / FPR for 'none'
+        decoded_binary = (decoded > 0).float()
+        keys_binary = msg_keys
+        TP = torch.sum((decoded_binary == 1) & (keys_binary == 1), dim=-1)
+        FP = torch.sum((decoded_binary == 1) & (keys_binary == 0), dim=-1)
+        TN = torch.sum((decoded_binary == 0) & (keys_binary == 0), dim=-1)
+        FN = torch.sum((decoded_binary == 0) & (keys_binary == 1), dim=-1)
+        TPR = TP / (TP + FN + 1e-8)
+        FPR = FP / (FP + TN + 1e-8)
+
+        # log base metrics
+        metric_logger.update(
+            psnr=utils_img.psnr(imgs_w, imgs_d0).mean().item(),
+            bit_acc_none=bit_accs.mean().item(),
+            word_acc_none=word_accs.float().mean().item(),
+            tpr_none=torch.mean(TPR).item(),
+            fpr_none=torch.mean(FPR).item(),
+        )
+
+        # --- robustness under attacks (apply to imgs_w then transform+decode) ---
+        attacks = {
+            'none': lambda x: x,
+            'crop_01': lambda x: utils_img.center_crop(x, 0.1),
+            'crop_05': lambda x: utils_img.center_crop(x, 0.5),
+            'rot_25': lambda x: utils_img.rotate(x, 25),
+            'rot_90': lambda x: utils_img.rotate(x, 90),
+            'resize_03': lambda x: utils_img.resize(x, 0.3),
+            'resize_07': lambda x: utils_img.resize(x, 0.7),
+            'brightness_1p5': lambda x: utils_img.adjust_brightness(x, 1.5),
+            'brightness_2': lambda x: utils_img.adjust_brightness(x, 2),
+            'jpeg': lambda x: utils_img.jpeg_compress(x, 80),
+            'blur': lambda x: utils_img.jpeg_compress(x, 50),
+        }
+        for name, attack in attacks.items():
+            imgs_attacked = attack(imgs_w)
+            imgs_aug_a = (optimized_transform(imgs_attacked, params.img_size)
+                          if params.transform_fuse else
+                          optimized_transform(imgs_attacked))
+            patch_a   = _decode_with_tile(imgs_aug_a, msg_decoder, params)
+            decoded_a = msg_decoder(patch_a)
+            if params.reed_solomon:
+                decoded_a = decode_reed_solomon(decoded_a,
+                                                params.num_bits,
+                                                params.num_parity_symbols,
+                                                params.m_bits_per_symbol)
+            diff_a = ~torch.logical_xor(decoded_a > 0, msg_keys > 0)
+            bit_accs_a = diff_a.sum(dim=-1) / diff_a.size(-1)
+            word_accs_a = (bit_accs_a == 1)
+            metric_logger.update(**{
+                f'bit_acc_{name}': bit_accs_a.mean().item(),
+                f'word_acc_{name}': word_accs_a.float().mean().item(),
+            })
+
+        # optionally dump a few images
+        if ii % params.save_img_freq == 0:
+            save_image(torch.clamp(utils_img.unnormalize_vqgan(imgs),   0, 1), os.path.join(params.imgs_dir, f'{ii:03}_val_orig.png'), nrow=8)
+            save_image(torch.clamp(utils_img.unnormalize_vqgan(imgs_d0), 0, 1), os.path.join(params.imgs_dir, f'{ii:03}_val_d0.png'),   nrow=8)
+            save_image(torch.clamp(utils_img.unnormalize_vqgan(imgs_w),  0, 1), os.path.join(params.imgs_dir, f'{ii:03}_val_w.png'),    nrow=8)
+
+    print("Averaged Eval stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 if __name__ == '__main__':
 

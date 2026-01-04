@@ -1,11 +1,9 @@
-# 1) Base system dependencies + Python 3.11
 FROM nvcr.io/nvidia/cuda:12.0.1-devel-ubuntu22.04
 
-# 2) assign workdir and set noninteractive mode for apt-get
 WORKDIR /workspace
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 3) Base system dependencies + Python 3.11
+# 1) Base system dependencies + Python 3.10
 RUN apt-get update -y \
      && apt-get install -y --no-install-recommends \
      apt-transport-https \
@@ -42,36 +40,39 @@ RUN apt-get update -y \
      python3.10-dev \
      python3-pip \
      python3-setuptools \
-     git \
      && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
      && ln -sf /usr/bin/pip3 /usr/bin/pip \
      && python -m pip install --upgrade pip \
      && rm -rf /var/lib/apt/lists/*
 
-# 4) Qt6 for Nsight Compute GUI
+# 2) Qt6 for Nsight Compute GUI
 RUN apt-get update -y \
      && apt-get install -y --no-install-recommends qt6-base-dev \
      && rm -rf /var/lib/apt/lists/*
 
-# 5-9) Python requirements
-RUN python -m pip install --upgrade pip \
-     && pip install --no-cache-dir setuptools wheel packaging ninja
-# Need to first install pytorch then flash attention to avoid the conflict of the version.
+# 3) Python requirements
 COPY requirements.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
      && rm /tmp/requirements.txt
 
-# 10) Add NVIDIA repo keyring & install cuDNN + Nsight tools (APT)
+# 4) Add NVIDIA repo keyring & install cuDNN (with cache purge)
 RUN rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
      && wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb \
-     && dpkg -i cuda-keyring_1.0-1_all.deb && rm -f cuda-keyring_1.0-1_all.deb \
+     && dpkg -i cuda-keyring_1.0-1_all.deb \
+     && rm cuda-keyring_1.0-1_all.deb \
      && apt-get update -y \
-     && apt-get install -y --no-install-recommends \
-     libcudnn9-cuda-12 \
-     nsight-compute-2025.3.1 \
-     nsight-systems-2025.3.2 \
+     && apt-get install -y --no-install-recommends libcudnn9-cuda-12=9.1.0.* \
      && apt-get clean \
      && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# 11) Sanity checks: fail the build if tools aren't available
-RUN ncu --version && nsys --version && which ncu && which nsys
+# 5) Install Nsight Compute
+RUN wget -O nsight-compute.run https://developer.nvidia.com/downloads/assets/tools/secure/nsight-compute/2025_2_0/nsight-compute-linux-2025.2.0.11-35613519.run \
+     && chmod +x nsight-compute.run \
+     && ./nsight-compute.run -- -noprompt \
+     && rm nsight-compute.run
+
+# 6) Install Nsight Systems
+RUN wget -O nsight-sys.run https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2025_3/NsightSystems-linux-public-2025.3.1.90-3582212.run \
+     && chmod +x nsight-sys.run \
+     && ./nsight-sys.run -- -noprompt \
+     && rm nsight-sys.run

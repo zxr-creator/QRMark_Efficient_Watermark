@@ -50,7 +50,7 @@ python QRMark_generate.py \
     --num_bits 48 \
     --val_batch_size 16 \
     --train_dir dataset/COCO/train/ \
-    --img_size 512 \
+    --img_size 256 \
     --val_dir dataset/COCO/val/ \
     --msg_decoder_path models/random_grid_64_48_new.pth \
     --reed_solomon True \
@@ -62,5 +62,5 @@ python QRMark_generate.py \
     --val_img_num $VAL_IMG_NUM \
     --output_dir "$OUTPUT_GEN_DIR" \
     --workload images \
-    --wm_dir  "dataset/watermark_imgs_tile_512" \
+    --wm_dir  "dataset/watermark_imgs_tile_256" \
 > "${LOGFILE_GEN2}" 2>&1
